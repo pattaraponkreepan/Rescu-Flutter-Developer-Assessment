@@ -3,8 +3,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:get/get.dart';
 import 'package:rescu/feature/shared_widget/countdown.dart';
 import 'package:rescu/model/deal_model.dart';
+import 'package:rescu/repository/order_repo.dart';
 import 'package:rescu/service/cart_service.dart';
 import 'package:rescu/service/clock_service.dart';
+
+import 'support/fake_order_repo.dart';
 
 DealModel _flashDeal(int id, DateTime endsAt) => DealModel.fromJson({
       'id': id,
@@ -112,6 +115,8 @@ void main() {
     testWidgets('bag drops a flash deal when it ends, with a notice',
         (tester) async {
       startClock();
+      final repo = Get.put<OrderRepo>(FakeOrderRepo(now: () => now))
+          as FakeOrderRepo;
       final cart = Get.put(CartService());
       await tester.pumpWidget(const GetMaterialApp(home: Scaffold()));
 
@@ -124,6 +129,8 @@ void main() {
       expect(cart.items.map((i) => i.deal.id), [2]);
       expect(cart.itemCount.value, 1);
       expect(find.text('Removed from your bag'), findsOneWidget);
+      expect(repo.released, ['res_1'],
+          reason: "the ended deal's hold is released");
 
       // An ended deal can't be added back.
       cart.add(_flashDeal(1, now.subtract(const Duration(seconds: 1))));
