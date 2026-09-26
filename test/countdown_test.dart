@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get/get.dart';
-import 'package:rescu/feature/shared_widget/flash_countdown.dart';
+import 'package:rescu/feature/shared_widget/countdown.dart';
 import 'package:rescu/model/deal_model.dart';
 import 'package:rescu/service/cart_service.dart';
 import 'package:rescu/service/clock_service.dart';
@@ -71,7 +71,7 @@ void main() {
       await tester.pumpWidget(MaterialApp(
         home: Builder(builder: (context) {
           parentBuilds++;
-          return FlashCountdownText(
+          return CountdownText(
               endsAt: now.add(const Duration(minutes: 1, seconds: 5)));
         }),
       ));
@@ -91,7 +91,7 @@ void main() {
       startClock();
       final states = <bool>[];
       await tester.pumpWidget(MaterialApp(
-        home: FlashExpiryBuilder(
+        home: ExpiryBuilder(
           endsAt: now.add(const Duration(seconds: 3)),
           builder: (context, expired) {
             states.add(expired);

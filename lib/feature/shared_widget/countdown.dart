@@ -17,16 +17,16 @@ String formatCountdown(Duration remaining) {
   return h > 0 ? '${two(h)}:${two(m)}:${two(s)}' : '${two(m)}:${two(s)}';
 }
 
-/// Live "time left" text for a flash sale.
+/// Live "time left" text (flash sales, bag reservations).
 ///
 /// Only this Text is inside the Obx, so the per-second tick rebuilds the text
 /// and nothing around it. Tabular figures keep its width constant, so the
 /// ticking digits don't re-lay out the badge they sit in.
-class FlashCountdownText extends StatelessWidget {
+class CountdownText extends StatelessWidget {
   final DateTime endsAt;
   final TextStyle? style;
 
-  const FlashCountdownText({super.key, required this.endsAt, this.style});
+  const CountdownText({super.key, required this.endsAt, this.style});
 
   @override
   Widget build(BuildContext context) {
@@ -65,7 +65,7 @@ class FlashSaleBadge extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 const Text('FLASH SALE · ', style: textStyle),
-                FlashCountdownText(endsAt: endsAt, style: textStyle),
+                CountdownText(endsAt: endsAt, style: textStyle),
               ],
             ),
     );
@@ -78,21 +78,21 @@ class FlashSaleBadge extends StatelessWidget {
 /// It schedules one Timer for the expiry moment instead of listening to the
 /// per-second tick, so a card switches to its expired state without being
 /// rebuilt every second. A null [endsAt] (not a flash deal) never expires.
-class FlashExpiryBuilder extends StatefulWidget {
+class ExpiryBuilder extends StatefulWidget {
   final DateTime? endsAt;
   final Widget Function(BuildContext context, bool expired) builder;
 
-  const FlashExpiryBuilder({
+  const ExpiryBuilder({
     super.key,
     required this.endsAt,
     required this.builder,
   });
 
   @override
-  State<FlashExpiryBuilder> createState() => _FlashExpiryBuilderState();
+  State<ExpiryBuilder> createState() => _ExpiryBuilderState();
 }
 
-class _FlashExpiryBuilderState extends State<FlashExpiryBuilder> {
+class _ExpiryBuilderState extends State<ExpiryBuilder> {
   final _clock = Get.find<ClockService>();
   Timer? _timer;
   bool _expired = false;
@@ -104,7 +104,7 @@ class _FlashExpiryBuilderState extends State<FlashExpiryBuilder> {
   }
 
   @override
-  void didUpdateWidget(FlashExpiryBuilder oldWidget) {
+  void didUpdateWidget(ExpiryBuilder oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.endsAt != widget.endsAt) _schedule();
   }

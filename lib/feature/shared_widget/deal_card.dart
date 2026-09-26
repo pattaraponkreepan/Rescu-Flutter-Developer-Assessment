@@ -4,7 +4,7 @@ import 'package:get/get.dart';
 import '../../app_config.dart';
 import '../../model/deal_model.dart';
 import '../../routes/routes.dart';
-import 'flash_countdown.dart';
+import 'countdown.dart';
 import 'the_network_image.dart';
 
 /// Deal card used in the home feed and search results.
@@ -19,7 +19,7 @@ class DealCard extends StatelessWidget {
     if (!deal.isFlashSale) return _buildCard(context, expired: false);
     // Rebuilds the card once, when the sale ends; the ticking countdown itself
     // only rebuilds its own Text.
-    return FlashExpiryBuilder(
+    return ExpiryBuilder(
       endsAt: deal.flashSaleEndsAt,
       builder: (context, expired) => _buildCard(context, expired: expired),
     );

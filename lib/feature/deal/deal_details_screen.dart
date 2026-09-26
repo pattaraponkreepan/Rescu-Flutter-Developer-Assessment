@@ -3,7 +3,7 @@ import 'package:get/get.dart';
 
 import '../../app_config.dart';
 import '../../model/deal_model.dart';
-import '../shared_widget/flash_countdown.dart';
+import '../shared_widget/countdown.dart';
 import '../shared_widget/the_network_image.dart';
 import 'deal_details_controller.dart';
 
@@ -163,7 +163,7 @@ class DealDetailsScreen extends GetView<DealDetailsController> {
         color: Colors.white,
         child: SizedBox(
           width: double.infinity,
-          child: FlashExpiryBuilder(
+          child: ExpiryBuilder(
             endsAt: deal.flashSaleEndsAt,
             builder: (context, expired) => FilledButton.icon(
               onPressed: expired ? null : controller.addToCart,
@@ -185,7 +185,7 @@ class _FlashSaleBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return FlashExpiryBuilder(
+    return ExpiryBuilder(
       endsAt: endsAt,
       builder: (context, expired) {
         final color = expired ? Colors.grey.shade700 : Colors.red.shade700;
@@ -206,7 +206,7 @@ class _FlashSaleBanner extends StatelessWidget {
                 Text('Flash sale ended', style: style)
               else ...[
                 Text('Flash sale ends in ', style: style),
-                FlashCountdownText(endsAt: endsAt, style: style),
+                CountdownText(endsAt: endsAt, style: style),
               ],
             ],
           ),
