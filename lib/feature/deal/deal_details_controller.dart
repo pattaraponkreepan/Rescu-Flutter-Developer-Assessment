@@ -93,6 +93,15 @@ class DealDetailsController extends GetxController {
   void addToCart() {
     final deal = this.deal;
     if (deal == null) return;
+    if (cartService.isExpired(deal)) {
+      Get.snackbar(
+        'Flash sale ended',
+        '${deal.name} can no longer be added to your bag.',
+        snackPosition: SnackPosition.BOTTOM,
+        duration: const Duration(seconds: 2),
+      );
+      return;
+    }
     cartService.add(deal);
     Get.snackbar(
       'Added to bag',
