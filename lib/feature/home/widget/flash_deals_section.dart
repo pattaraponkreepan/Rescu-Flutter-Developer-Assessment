@@ -5,7 +5,7 @@ import '../../../app_config.dart';
 import '../../../model/deal_model.dart';
 import '../../../routes/routes.dart';
 import '../../shared_widget/deal_impression.dart';
-import '../../shared_widget/flash_countdown.dart';
+import '../../shared_widget/countdown.dart';
 import '../../shared_widget/the_network_image.dart';
 
 /// Horizontal flash-sale rail, with a live countdown per deal.
@@ -42,7 +42,7 @@ class FlashDealsSection extends StatelessWidget {
                 deal: deal,
                 source: 'flash_rail',
                 position: index,
-                child: FlashExpiryBuilder(
+                child: ExpiryBuilder(
                   endsAt: deal.flashSaleEndsAt,
                   builder: (context, expired) => _buildItem(deal, expired),
                 ),
@@ -123,7 +123,7 @@ class FlashDealsSection extends StatelessWidget {
                                       fontSize: 11,
                                       fontWeight: FontWeight.w600,
                                       color: Colors.grey.shade700))
-                              : FlashCountdownText(
+                              : CountdownText(
                                   endsAt: deal.flashSaleEndsAt!,
                                   style: TextStyle(
                                       fontSize: 11,

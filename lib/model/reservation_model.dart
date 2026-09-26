@@ -23,4 +23,6 @@ class ReservationModel {
   }
 
   bool get isExpired => DateTime.now().toUtc().isAfter(expiresAt);
+
+  bool isExpiredAt(DateTime now) => !now.isBefore(expiresAt);
 }

@@ -13,7 +13,7 @@
 | RES-107 · Deep link opens to a crash | Fixed |
 | F-1 · Live flash-sale countdowns | Done (tests + rebuilds profiled) |
 | F-2 · Impression tracking | Done (tests + verified on device, no scroll regression) |
-| F-3 | Not started |
+| F-3 · Stock reservations with optimistic UI | Done (tests + verified on device) |
 
 ---
 
@@ -928,4 +928,162 @@ These use a fake-async clock and a recording API:
 - **Not handled:** batches can exceed 10 if more events arrive while a
   request is in flight. They are sent together right after it. Splitting
   them into chunks of 10 is easy if the backend caps batch size.
+
+---
+
+## F-3 · Stock reservations with optimistic UI
+
+### The API contract, as I read it (`FakeApiService`)
+
+- `reserveDeal(dealId, quantity)` creates **one** hold for the whole quantity,
+  valid for 5 minutes. There is no "update hold" endpoint, so changing a
+  line's quantity means a new reservation, then releasing the old one.
+- Every 5th write (reserve or checkout, `_mutationCounter % 5 == 3`) fails:
+  a 409 on reserve, a 502 on checkout. So the error paths are exercised
+  constantly, not rarely.
+- Checkout validates every `reservationId` **before** creating the order or
+  touching stock, and rejects with 410 if one is unknown or expired, without
+  saying which one. Nothing is charged in that case. (Its intermittent 502
+  can fire even before that check.)
+- Checkout does not consume or delete reservations. They simply expire.
+
+### What it does
+
+- **Optimistic add.** "Add to bag" (details screen, or **+** in the bag)
+  updates the bag and the badge immediately. The line shows "Reserving…"
+  until the hold arrives, then **"Held for 04:59"**, counting down.
+- **Reconciliation.** If the reservation fails, the line goes back to what
+  is actually held, with a plain message:
+  - a new line is removed: "*X wasn't added to your bag*: Someone just
+    grabbed the last one.";
+  - a quantity increase is reverted: "…You still have 1 reserved."
+- **Quantity changes adjust the hold.** The new amount is reserved
+  **before** the old hold is released, so a line is never left unheld while
+  it changes. Removing a line (− down to 0) releases its hold. So does a
+  flash deal dropping out of the bag (F-1).
+- **Checkout sends each line's `reservationId`**, and handles 409 / 410 /
+  502 as described below.
+- The quantity buttons are **locked during checkout**, so the bag can't
+  change under the order being placed.
+
+### Design
+
+All of this lives in `CartService`, which is session-scoped, so holds
+survive navigating away from the bag.
+
+- `CartItemModel.quantity` is what the user sees. `CartItemModel.reservation`
+  is what the server actually holds. A line is "held" when both agree and
+  the hold hasn't expired.
+- `_syncHold(dealId)` reconciles one line. There is **one request per line
+  at a time**. If the user taps + three times while the first request is in
+  flight, the loop then asks once for 3, not three times out of order. That
+  is the RES-101 lesson again: never let responses land in the wrong order.
+  The old hold is released only after the new one exists.
+- A reservation that arrives for a line the user already removed is
+  released immediately, so holds don't leak.
+- `ensureHolds()` runs before checkout. It waits for pending syncs, then
+  reserves again any line whose hold is missing, mismatched, expired or
+  **expiring within 30 s**, so a hold can't run out while the checkout
+  request is in flight.
+
+### Decision: what happens when a hold expires in the app
+
+This part of the brief is deliberately open. My decision:
+
+1. **The item stays in the bag.** The line shows "Reservation ran out" with
+   a **Reserve again** button, and a one-time notice says: "…is still in
+   your bag but no longer held for you. We'll try to reserve again when you
+   check out."
+2. **There is no silent auto-renewal.** The app doesn't keep re-reserving
+   in the background.
+3. **At checkout, lapsed lines are reserved again automatically.** If one
+   can no longer be held (sold out), it is removed, and checkout **stops**
+   with "*X* was removed from your bag. Nothing was charged. Check your bag
+   and tap Checkout again." The user confirms the new bag.
+4. **A 410 during checkout** (a hold lapsed between our check and the
+   server, for example because of clock skew) → take fresh holds on
+   **every** line (the 410 doesn't say which) and **retry once**. That is
+   safe because the server validates reservations before charging. If the
+   retry also fails, the user gets a clear "nothing was charged, try again".
+
+**Why:**
+
+- **Auto-renewing forever (rejected).** It defeats the purpose of a 5 minute
+  hold. An idle phone on a table would lock the last bag away from other
+  customers indefinitely. For a surplus-food marketplace, where stock is
+  tiny and time-critical, that is the wrong trade-off.
+- **Removing the item when its hold lapses (rejected).** The user loses
+  their bag for stepping away for a few minutes, although the item is most
+  likely still available. The hold is a *guarantee*. Losing the guarantee
+  shouldn't mean losing the intent.
+- **Auto-checkout without the unavailable item (rejected).** That charges
+  for a different order than the one the user saw and confirmed. Stopping
+  costs one extra tap, and it is the honest choice.
+- **Retrying a 410 once, but not a 502, automatically.** A 410 is
+  deterministic and pre-payment, and we can fix its cause (fresh holds). A
+  502 is a payment-gateway failure. Retrying payments automatically is
+  riskier, so the user decides; the message tells them they weren't
+  charged.
+- **Retrying a 409 once at checkout (but not on "Add to bag").** The 409
+  text is "someone grabbed the last one. Try again". At checkout, one quick
+  retry avoids throwing an item out of the bag over momentary contention. A
+  real sell-out fails again and is handled as above. On "Add to bag" the
+  user is looking at the screen and can simply tap again, so the rollback
+  message is enough.
+
+### Verified on the emulator
+
+| Step | Log / screen |
+|---|---|
+| Add deals 1, 2, 3 | `POST /reservations` ×3. The 3rd hits the backend's scheduled 409, and deal 3 is rolled out of the bag. |
+| Bag | Two lines, "Held for 04:33" / "Held for 04:43", counting down. |
+| **+** on line 1 | Quantity 2 and total ฿426 **instantly**, "Updating reservation…", then `POST /reservations dealId=1 qty=2` → `DELETE /reservations/res_1`. The old hold is released only after the new one exists. |
+| Wait 5 min | Line 2 → "Reservation ran out" + **Reserve again**, still in the bag. One notice. |
+| Checkout | Lapsed (and nearly lapsed) holds are reserved again first, then `POST /checkout items=2` → "Order confirmed, #9107". The bag is emptied. |
+
+**A bug the device caught.** The first version of the lapsed row
+("Reservation ran out" + button in a `Row`) overflowed by 23 px on the
+Pixel 8 screen. I changed it, and the "Held for" row, to `Wrap`. The
+"Held for" row fitted, but it would overflow with larger system font sizes.
+A widget test now renders the bag at the Pixel 8 size and fails on any
+overflow. I checked that it does fail when the lapsed row is put back to a
+`Row`.
+
+### Tests (`test/reservation_test.dart`, 12 tests; fake clock + `FakeOrderRepo`)
+
+- **Optimistic add:** the line exists before the server answers, and the
+  hold is attached when it does.
+- **Rollback:** a failed first reservation removes the line, with the
+  message. A failed increase goes back to the held quantity and keeps the
+  old hold.
+- **Rapid taps:** one request at a time, and the final hold equals the bag
+  (1 → 3). The superseded hold is released.
+- **Decrement** re-reserves the smaller amount and releases the old hold.
+  **Removing** a line whose reservation is still in flight releases the late
+  hold.
+- **Lapse:** the item stays, one notice, and **Reserve again** renews it.
+- **Checkout:**
+  - sends reservation ids and doesn't release them;
+  - renews holds with less than 30 s left before paying;
+  - on 410, takes fresh holds on everything and retries once;
+  - on sold out at renewal, removes the item and makes **no** checkout call;
+  - on 502, keeps the bag with "you weren't charged".
+- **Bag screen at phone size:** "Held for 05:00", then the lapsed state,
+  with no overflow.
+
+### Edge cases / not handled
+
+- **Holds after a successful checkout** are not released: the order used
+  them, and they expire server-side anyway.
+- **The backend doesn't subtract holds from `quantityLeft`.** That is a
+  server concern. The client only relies on the reservation succeeding or
+  failing.
+- **App killed with items in the bag:** the bag is in memory (as in the
+  starter), so the holds just expire on the server. Persisting the bag is
+  out of scope.
+- **Release failures** are logged and ignored. The hold expires on its own
+  within 5 minutes.
+- **Not handled:** a flash sale ending *during* the checkout request. The
+  server doesn't know about flash expiry, so the order would go through at
+  the flash price that was valid when the user tapped.
 
