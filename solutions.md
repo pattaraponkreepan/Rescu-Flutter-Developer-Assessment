@@ -5,7 +5,8 @@
 | Ticket / feature | Status |
 |---|---|
 | RES-101 · Search shows results for the wrong query | Fixed |
-| RES-102 – RES-107 | Not started |
+| RES-102 · Crash after leaving My orders | Fixed |
+| RES-103 – RES-107 | Not started |
 | F-1 – F-3 | Not started |
 
 ---
@@ -101,3 +102,74 @@ dependencies.
 I re-ran the repro on the emulator after the fix. The responses still arrived
 out of order (`sushi` → `su` → `sush` → `s`), and the list correctly showed
 *Surprise Sushi Box*, *Lucky Sushi Platter* and *End-of-day Sushi Bag*.
+
+---
+
+## RES-102 · Crash after leaving My orders
+
+### Reproduction
+
+On the Android emulator, open **My orders** (the seed data has three active
+orders with upcoming pickups), then tap Back. Within a second the console
+shows the following, and it repeats every second from then on:
+
+```
+Unhandled Exception: setState() called after dispose(): _PickupCountdownState#60bb9 (lifecycle state: defunct, not mounted)
+#2 _PickupCountdownState.initState.<anonymous closure> (package:rescu/feature/order/widget/pickup_countdown.dart:22:7)
+#3 _Timer._runTimers (dart:isolate-patch/timer_impl.dart:398:19)
+```
+
+It is logged three times per tick: once per active order.
+
+### Root cause
+
+`PickupCountdown` (`lib/feature/order/widget/pickup_countdown.dart`) is a
+`StatefulWidget`. It starts a `Timer.periodic` in `initState` and calls
+`setState` every second. The timer was never stored and never cancelled, so
+it **outlives the widget**. Leaving My orders disposes the `State`, the timer
+fires again, and `setState()` runs on a defunct `State`.
+
+This is also a leak, not just a noisy error. Each live timer keeps a
+reference to its `State`, so every visit to My orders adds one more immortal
+timer per active order. Those timers keep firing (and allocating) for the
+rest of the session.
+
+### Fix
+
+Keep the timer in a field and cancel it in `dispose()`. A resource opened in
+`initState` is closed in `dispose`, so its lifetime matches the widget's.
+
+### Why this fix
+
+The countdown's lifetime belongs to the widget, and nothing else in the app
+depends on this timer. Cancelling it in `dispose()` removes the cause: no
+timer survives the widget, so no `setState` on a disposed `State` and no
+leaked references.
+
+### Alternatives considered
+
+- **`if (mounted) setState(...)`**. Rejected. It silences the exception, but
+  the timer keeps running forever and keeps the `State` alive. That hides the
+  symptom and keeps the leak, which is exactly what the brief warns against.
+- **try/catch around `setState`**. Rejected for the same reason.
+- **Moving the tick into `OrdersController` as an `RxInt`/`Timer` cancelled in
+  `onClose`**. Rejected for this ticket. It would work, but it moves
+  view-only state into the controller and is a larger change than the bug
+  needs. A shared ticker is worth revisiting for F-1, where many countdowns
+  have to tick together cheaply.
+
+### Edge cases
+
+- Several active orders: each tile owns and cancels its own timer.
+- Returning to My orders several times: the old timers are gone, so they no
+  longer pile up.
+- **Not handled:** once the pickup window is open, the text no longer
+  changes, but the timer still ticks every second while the screen is
+  visible. That is harmless because it is cancelled on dispose, but it could
+  be stopped early as an optimisation.
+
+### Verification
+
+On the emulator I opened and closed My orders twice after the fix. There were
+0 `setState() called after dispose()` errors, and the countdowns ("Opens in
+17:50", "46:50", "2h 11m") still ticked while the screen was open.
