@@ -6,7 +6,8 @@
 |---|---|
 | RES-101 · Search shows results for the wrong query | Fixed |
 | RES-102 · Crash after leaving My orders | Fixed |
-| RES-103 – RES-107 | Not started |
+| RES-103 · Requests pile up the longer you browse | Fixed |
+| RES-104, RES-105, RES-106, RES-107 | Not started |
 | F-1 – F-3 | Not started |
 
 ---
@@ -173,3 +174,92 @@ leaked references.
 On the emulator I opened and closed My orders twice after the fix. There were
 0 `setState() called after dispose()` errors, and the countdowns ("Opens in
 17:50", "46:50", "2h 11m") still ticked while the screen was open.
+
+---
+
+## RES-103 · Requests pile up the longer you browse
+
+### Reproduction
+
+On the Android emulator, open deal 1 and go back, then open deal 5 and go
+back. Open deal 2 and tap **Add to bag** once. That single tap produces:
+
+```
+re-checking availability for deal 1
+re-checking availability for deal 5
+re-checking availability for deal 2
+GET /deals/5
+GET /deals/2
+GET /deals/1
+```
+
+That is three requests, two of them for screens that were closed earlier.
+Each deal page you view adds one more request to every later cart change.
+
+### Root cause
+
+`DealDetailsController.onInit` subscribes to the cart:
+
+```dart
+ever(cartService.itemCount, (_) => _recheckAvailability());
+```
+
+`ever` subscribes directly to the `Rx`'s stream and returns a `Worker`. It is
+**not** tied to the controller's lifecycle (I checked `get` 4.7.3,
+`rx_workers.dart`: it is a plain `listener.listen(...)`). The worker was
+never stored or disposed.
+
+`CartService` is a `GetxService` that lives for the whole session. So:
+
+1. Leaving a deal page deletes the controller (`onClose` runs), but the
+   subscription on `CartService.itemCount` stays alive.
+2. The subscription holds the closure, and the closure holds the controller.
+   The disposed controller cannot be garbage-collected (a leak).
+3. Every later cart change calls `_recheckAvailability()` on every controller
+   ever created, which fires `GET /deals/:id` for screens that no longer
+   exist.
+
+The bug comes from treating the controller as if its subscriptions die with
+it. A subscription on a longer-lived object lives as long as that object,
+unless we cancel it.
+
+### Fix
+
+Keep the `Worker` returned by `ever` and dispose it in `onClose()`. The
+subscription now has the same lifetime as the screen that needs it.
+
+### Why this fix
+
+It removes the cause, not just the extra traffic: no subscription outlives
+its controller, so there are no stale requests and no leaked controllers. The
+"re-check stock when the cart changes" behaviour still works for the screen
+that is actually open.
+
+### Alternatives considered
+
+- **Guard `_recheckAvailability` with an `isClosed` check.** Rejected. It
+  stops the requests but keeps every dead controller subscribed and in
+  memory, so it hides the symptom.
+- **Debounce or throttle the re-check.** Rejected. It reduces the burst but
+  still issues one request per dead screen.
+- **Fetch stock once in `onInit` / pull-to-refresh only.** Rejected for this
+  ticket. It changes product behaviour (live availability on cart change),
+  and the ticket is about the leak, not the feature.
+
+### Edge cases
+
+- Pages opened several times: each visit creates and closes its own worker,
+  so nothing accumulates.
+- **Not handled:** if the controller closes while a `fetchById` is still in
+  flight, the response is written to the closed controller's `Rx`. That is
+  harmless (nobody listens anymore), so I left it.
+
+### Verification
+
+Same script on the emulator after the fix (deal 1 → back, deal 5 → back,
+deal 2 → Add to bag). **One** request, down from three:
+
+```
+re-checking availability for deal 2
+GET /deals/2
+```
