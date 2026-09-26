@@ -5,7 +5,8 @@
 | Ticket / feature | Status |
 |---|---|
 | RES-101 · Search shows results for the wrong query | Fixed |
-| RES-102 – RES-107 | Not started |
+| RES-105 · Home feed is janky and memory keeps climbing | Fixed (measured before/after) |
+| RES-102 – RES-104, RES-106, RES-107 | Not started |
 | F-1 – F-3 | Not started |
 
 ---
@@ -101,3 +102,133 @@ dependencies.
 I re-ran the repro on the emulator after the fix. The responses still arrived
 out of order (`sushi` → `su` → `sush` → `s`), and the list correctly showed
 *Surprise Sushi Box*, *Lucky Sushi Platter* and *End-of-day Sushi Bag*.
+
+---
+
+## RES-105 · Home feed is janky and memory keeps climbing
+
+### How I measured
+
+All numbers come from the Dart VM service, from the same events DevTools
+uses: `Flutter.Frame` for the frame chart, `Flutter.RebuiltWidgets` for Rebuild
+Stats, and `PaintingBinding.imageCache` for image memory. Process memory comes
+from `adb shell dumpsys meminfo`. Each run:
+
+- **Device:** Android emulator (Pixel 8, API 35, x86_64).
+- **Starting state:** app data cleared first (`pm clear`), so both runs start
+  with an empty image disk cache.
+- **Gestures:** the same scripted flings down the home feed (`adb input
+  swipe`).
+
+Rebuild counts and image-cache size need **debug** mode (widget-creation
+tracking and `evaluate`). Frame times and memory come from **profile** mode,
+because debug-mode timings are not representative.
+
+### Root causes
+
+There are three separate problems.
+
+**1. The whole screen rebuilt on every scroll pixel.**
+`HomeController._onScroll` wrote `scrollController.offset` into
+`scrollOffset` (an `RxDouble`) on every scroll notification. `HomeScreen`
+read it at the top of a single `Obx` wrapping the entire `Scaffold`: app bar,
+feed and FAB. Every scrolled pixel changed the value, so every frame rebuilt
+the whole screen, including every mounted `DealCard`. The screen only needed
+two booleans from that value ("scrolled past 4 px" for the app-bar elevation,
+"past 800 px" for the scroll-to-top FAB).
+
+**2. The feed was an eager `ListView(children: [...])`.**
+On each rebuild it constructed a `DealCard` widget for *every* loaded deal
+(up to 122) and diffed the list, even though only about 3 are on screen.
+Combined with (1), that happened on every scroll frame, and the cost grew
+with every page loaded.
+
+**3. Images were decoded at full source resolution.**
+The API serves 1600×1200 images: 1600 × 1200 × 4 bytes ≈ **7.3 MB** per
+decoded image. The feed draws them at about 380×160 dp. `CachedNetworkImage`
+had no `memCacheWidth`, so every image was decoded and uploaded as a GPU
+texture at full size. The 100 MB `ImageCache` filled up after only 13
+images, so scrolling back meant evicting, re-decoding and re-uploading. Live
+images (on screen or loading) are not bounded by the cache limit at all.
+
+### Fix
+
+1. **Scope reactivity to what actually changes.** The controller exposes
+   `isScrolled` and `showScrollToTop` as `RxBool`s. GetX only notifies when an
+   `Rx`'s value changes, so scrolling triggers a rebuild only when a
+   threshold is crossed. `HomeScreen` now has three small `Obx`es: the app bar
+   (elevation), the body (loading, deals, filter) and the FAB. None of them
+   depends on the scroll position.
+2. **Build the feed lazily** with `ListView.builder`: the flash rail, the
+   header and the cards are created only when they come near the viewport.
+   All observables are read inside the `Obx` builder, so dependency tracking
+   still works (the item builder runs later, during layout).
+3. **Decode images at display size.** `TheNetworkImage` uses a
+   `LayoutBuilder` to find the box it is drawn into and passes
+   `memCacheWidth = box's larger side × devicePixelRatio`. A feed card now
+   decodes at about 1000 px wide instead of 1600, a flash-rail card at about
+   500 px, and an order thumbnail at about 170 px.
+
+### Before / after
+
+Debug mode, 15 flings:
+
+| Metric | Before | After |
+|---|---|---|
+| Widget rebuilds (total) | 15,009 | 4,408 |
+| `DealCard` builds | 550 | 119 |
+| Image cache | 95.2 MB for **13** images (7.3 MB each) | 99.3 MB for **35** images (2.8 MB each) |
+
+Profile mode, 30 flings, all 7 pages loaded:
+
+| Metric | Before | After |
+|---|---|---|
+| UI thread frame time: avg / p90 | 3.96 ms / 8.09 ms | 3.37 ms / 6.60 ms |
+| UI frames over 16.7 ms | 14 | 6 |
+| Total PSS | 152 MB | 140 MB |
+
+The 119 `DealCard` builds after the fix are each card being built once as
+it scrolls into view (about 6 pages were loaded). Before the fix, the cards
+already on screen were rebuilt on every frame.
+
+**What these numbers do not show:**
+
+- **Raster time.** It was about 34 ms per frame in both runs. That is the
+  emulator's virtualized GPU (nearly every frame is over budget in both runs,
+  whatever the widget tree does). It needs confirming on a real mid-range
+  device, where the smaller textures
+  should also reduce raster and GPU memory.
+- **The image cache's own size.** It sits near its 100 MB cap either way,
+  because that cap bounds it. What changed is how much content fits in it
+  (13 → 35 images) and the size of each live image, which the cap does not
+  bound.
+
+### Alternatives considered
+
+- **Keep `scrollOffset` but throttle or debounce the listener.** Rejected. It
+  still rebuilds the whole screen, just less often, and a delayed app-bar
+  elevation looks laggy.
+- **Material 3 `scrolledUnderElevation` instead of a listener.** Tempting,
+  since M3 is on and it needs no controller state. But it changes how the app
+  bar looks (tint instead of shadow), and the FAB still needs the threshold.
+  I kept the existing look.
+- **Shrinking `ImageCache.maximumSizeBytes`.** Rejected as the fix. With
+  7.3 MB images, a smaller cap only means more re-decoding. Once images are
+  decoded at display size, lowering the cap becomes a reasonable tuning
+  option, but it is not needed to fix the ticket.
+- **Setting both `memCacheWidth` and `memCacheHeight`.** Rejected.
+  `ResizeImage` with both set distorts the aspect ratio unless you pick a
+  policy, and no policy gives "cover".
+
+### Edge cases
+
+- Unbounded constraints (for example an image in an unconstrained scroll
+  direction): `_decodeWidth` returns null and decodes at full size, which is
+  the old behaviour, instead of guessing.
+- Square order thumbnails: sizing by the larger side and assuming a landscape
+  source leaves the decoded height at about 0.75 of the box (a slight
+  upscale, invisible at 64 dp). A portrait source would upscale more. The API
+  only serves 4:3 landscape images today.
+- **Not handled:** the shimmer placeholders use `ShaderMask`, and each one
+  costs a `saveLayer` per frame while an image is loading. That adds to
+  raster cost during loading. It is a smaller effect and I left it.
