@@ -11,7 +11,8 @@
 | RES-105 · Home feed is janky and memory keeps climbing | Fixed (measured before/after) |
 | RES-106 · Wrong pickup times; "Pickup today" misses deals | Fixed (with regression tests) |
 | RES-107 · Deep link opens to a crash | Fixed |
-| F-1 – F-3 | Not started |
+| F-1 · Live flash-sale countdowns | Done (tests + rebuilds profiled) |
+| F-2, F-3 | Not started |
 
 ---
 
@@ -694,3 +695,119 @@ On the emulator:
 | Home → ⋮ → **Simulate deep link…** → Open | Deal 42 loads (`GET /deals/42`). |
 | Tap a card in the feed | Opens instantly from the argument, no extra `GET /deals/:id`. |
 | Deep link with `id=99999` | "Couldn't load this deal" + Try again (API 404), no crash. |
+
+---
+
+## F-1 · Live flash-sale countdowns
+
+### What it does
+
+- **Flash rail, home feed / search cards, details screen:** the static "Ends
+  soon" label is replaced by a live countdown (`mm:ss`, or `hh:mm:ss` from one
+  hour up). The last second reads `00:01`, and the sale ends exactly when it
+  reaches zero, never while `00:00` is still showing.
+- **At zero:**
+  - Cards switch to a disabled **Expired** state: grey badge, dimmed image,
+    grey price, and they can no longer be tapped.
+  - The details screen shows "Flash sale ended" and its button becomes a
+    disabled **Flash sale ended**.
+  - If the deal is in the bag, it is removed and a snackbar says so: "Removed
+    from your bag: The flash sale for … has ended". This works on whatever
+    screen the user is on.
+- **An ended deal can't be added:** `CartService.add` refuses it (this also
+  covers the bag's "+" button). `DealDetailsController.addToCart` shows a
+  message if someone taps in the same second the sale ends.
+
+### Design: scope the per-second work to the text
+
+The requirement is that 100+ visible countdowns stay smooth and that
+per-second rebuilds touch only the text. That needs three pieces:
+
+1. **One ticker for the whole app.** `ClockService` (a `GetxService`) runs a
+   single `Timer.periodic(1s)` and exposes `now` as an `Rx<DateTime>`. With
+   100 countdowns on screen there is still one timer and one tick per second,
+   not 100 timers drifting apart. All countdowns also change on the same
+   frame, so the screen doesn't tick in a staggered way.
+2. **Only the `Text` listens to the tick.** `FlashCountdownText` is
+   `Obx(() => Text(format(endsAt - clock.now)))`, and that `Obx` is the only
+   thing that reads `now`. Each tick rebuilds exactly one `Text` per visible
+   countdown. The badge, card, list and screen are not rebuilt. The digits
+   use tabular figures, so their width doesn't change and the badge isn't
+   re-laid out every second.
+3. **Cards change state once, not every second.** `FlashExpiryBuilder` (a
+   `StatefulWidget`) schedules **one** `Timer` for the exact expiry moment and
+   calls `setState` once. So a card rebuilds a single time, when it expires,
+   rather than checking `now` on every tick. The timer is cancelled in
+   `dispose()` (lesson from RES-102), and rescheduled in `didUpdateWidget` if
+   the card is reused for another deal.
+
+Removal from the bag happens in `CartService`, which is app-scoped. An
+`ever(clock.now, …)` worker checks the few bag lines each second. It is
+disposed in `onClose` (lesson from RES-103), although the service lives for
+the whole session.
+
+### Measured
+
+These are debug-mode rebuild stats from the VM service (the data behind
+DevTools' Rebuild Stats), taken on the idle home screen for 10 seconds with
+one countdown visible:
+
+```
+widget rebuilds total: 20
+  10  Obx   flash_countdown.dart:36
+  10  Text  flash_countdown.dart:36
+```
+
+That is one `Text` rebuild per visible countdown per second, and **zero**
+rebuilds of `DealCard`, the list or `HomeScreen`.
+
+On the emulator, deal 5 ("Last-call Bakery Box", ends 8 minutes after launch)
+was in the bag together with a regular deal. At 02:53:39:
+
+- The card flipped to **EXPIRED**.
+- `cart: removed [5], flash sale ended` was logged.
+- The "Removed from your bag" snackbar appeared.
+- The regular deal stayed in the bag.
+- Tapping the expired card did nothing.
+
+### Tests (`test/flash_countdown_test.dart`)
+
+`ClockService` takes an injectable `currentTime`, so the tests drive time
+deterministically:
+
+- `formatCountdown`: `mm:ss`, `hh:mm:ss`, rounding up, never negative.
+- The countdown text ticks every second while its **parent builds exactly
+  once**. This is the rebuild-scoping requirement expressed as a test.
+- `FlashExpiryBuilder` rebuilds **exactly once**, at the expiry moment.
+- The bag drops an expired flash deal (keeping others), shows the snackbar,
+  and refuses to add it back.
+
+### Alternatives considered
+
+- **A `Timer.periodic` in each countdown widget.** Rejected. That means N
+  timers for N countdowns, and they tick out of phase with each other.
+  Getting the lifecycle wrong is also exactly RES-102.
+- **One `Obx` around the card (or list) that reads `now`.** Rejected. That
+  is the RES-105 anti-pattern: every card would rebuild every second.
+- **Each card listening to `now` and comparing it with `endsAt` to detect
+  expiry.** It works and doesn't rebuild the card, but it runs a callback
+  per card per second forever. A single one-shot `Timer` per card is
+  cheaper and exact.
+
+### Decisions and edge cases
+
+- **Expired cards are not tappable.** The brief asks for a *disabled* state.
+  If product wants people to still browse ended deals, re-enabling the tap is
+  a one-line change, and the details screen already handles the expired
+  state.
+- **Several bag items expiring in the same second** produce one snackbar
+  listing them, not a stack of snackbars.
+- **Precision:** the countdown text follows the shared one-second tick, so
+  it can lag real time by up to a second. The expired state itself uses the
+  exact-moment timer and is not delayed.
+- **Not handled:** the ticker keeps running while the app is in the
+  background (cheap, since nothing is built). Pausing it on
+  `AppLifecycleState.paused` would be a small follow-up.
+- **Not handled:** checkout racing the expiry (the sale ends during the
+  checkout request). That belongs to F-3's checkout/reservation handling.
+
