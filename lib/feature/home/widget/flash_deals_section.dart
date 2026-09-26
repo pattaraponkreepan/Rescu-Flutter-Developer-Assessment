@@ -4,6 +4,7 @@ import 'package:get/get.dart';
 import '../../../app_config.dart';
 import '../../../model/deal_model.dart';
 import '../../../routes/routes.dart';
+import '../../shared_widget/deal_impression.dart';
 import '../../shared_widget/flash_countdown.dart';
 import '../../shared_widget/the_network_image.dart';
 
@@ -37,9 +38,14 @@ class FlashDealsSection extends StatelessWidget {
             itemCount: deals.length,
             itemBuilder: (context, index) {
               final deal = deals[index];
-              return FlashExpiryBuilder(
-                endsAt: deal.flashSaleEndsAt,
-                builder: (context, expired) => _buildItem(deal, expired),
+              return DealImpression(
+                deal: deal,
+                source: 'flash_rail',
+                position: index,
+                child: FlashExpiryBuilder(
+                  endsAt: deal.flashSaleEndsAt,
+                  builder: (context, expired) => _buildItem(deal, expired),
+                ),
               );
             },
           ),
