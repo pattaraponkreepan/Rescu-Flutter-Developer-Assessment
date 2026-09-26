@@ -24,6 +24,10 @@ class HomeController extends GetxController {
   int _totalPages = 1;
   bool _isFetchingMore = false;
 
+  /// Bumped whenever a refresh replaces the feed. A page request started
+  /// before that belongs to the old feed and must not be applied to the new one.
+  int _feedGeneration = 0;
+
   bool get hasMore => _page < _totalPages;
 
   List<DealModel> get visibleDeals => todayOnly.value
@@ -56,8 +60,15 @@ class HomeController extends GetxController {
   }
 
   Future<void> refreshDeals() async {
-    _page = 1;
     final res = await dealRepo.fetchDeals(page: 1);
+    // The feed is being replaced: a page still in flight was requested for the
+    // old feed, so it will be dropped. End its footer spinner here since it won't.
+    _feedGeneration++;
+    if (_isFetchingMore) {
+      _isFetchingMore = false;
+      refreshController.loadComplete();
+    }
+    _page = 1;
     _totalPages = res.totalPages;
     deals.assignAll(res.items);
     refreshController.refreshCompleted();
@@ -69,15 +80,18 @@ class HomeController extends GetxController {
       refreshController.loadNoData();
       return;
     }
+    final generation = _feedGeneration;
+    final nextPage = _page + 1;
     _isFetchingMore = true;
-    _page++;
     try {
-      final res = await dealRepo.fetchDeals(page: _page);
+      final res = await dealRepo.fetchDeals(page: nextPage);
+      if (generation != _feedGeneration) return;
+      _page = nextPage;
       _totalPages = res.totalPages;
       deals.addAll(res.items);
     } catch (e) {
+      if (generation != _feedGeneration) return;
       LogService.error('loadMore failed', e);
-      _page--;
     }
     _isFetchingMore = false;
     refreshController.loadComplete();
