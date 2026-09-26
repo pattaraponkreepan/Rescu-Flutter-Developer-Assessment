@@ -5,7 +5,8 @@
 | Ticket / feature | Status |
 |---|---|
 | RES-101 · Search shows results for the wrong query | Fixed |
-| RES-102 – RES-107 | Not started |
+| RES-107 · Deep link opens to a crash | Fixed |
+| RES-102 – RES-106 | Not started |
 | F-1 – F-3 | Not started |
 
 ---
@@ -101,3 +102,98 @@ dependencies.
 I re-ran the repro on the emulator after the fix. The responses still arrived
 out of order (`sushi` → `su` → `sush` → `s`), and the list correctly showed
 *Surprise Sushi Box*, *Lucky Sushi Platter* and *End-of-day Sushi Bag*.
+
+---
+
+## RES-107 · Deep link opens to a crash
+
+### Reproduction
+
+With the app running on the emulator:
+
+```
+adb shell am start -a android.intent.action.VIEW -d "rescu://open/deal?id=42&source=push" dev.rescu.rescu
+```
+
+The result:
+
+```
+The following _TypeError was thrown building DealDetailsScreen(dirty):
+type 'Null' is not a subtype of type 'DealModel' in type cast
+#0  DealDetailsController.onInit (deal_details_controller.dart:28:26)
+```
+
+### Root cause
+
+`DealDetailsController.onInit` did `deal = Get.arguments as DealModel`. It
+assumed the screen is always opened from a list, which passes the whole
+`DealModel` as a navigation argument. A deep link (Android intent, or
+**Simulate deep link…**) is just a route string, `/deal?id=42&source=push`.
+It carries the id as a route parameter and has **no arguments**, so
+`Get.arguments` is `null` and the cast throws while building the screen.
+
+The route already contained everything needed. `Routes.dealRoute()` puts the
+`id` in the URL even for in-app navigation, and `DealRepo.fetchById` exists.
+The screen just never used them.
+
+### Fix
+
+- `DealDetailsController`: the deal is now an `Rxn<DealModel>`.
+  - If a `DealModel` argument is present (opened from a list), it is used
+    immediately, exactly as before, with no extra request.
+  - Otherwise the controller reads `id` from `Get.parameters` and fetches the
+    deal with `DealRepo.fetchById`.
+  - Analytics and the availability re-check use the id, so they work before
+    the deal has loaded.
+- `DealDetailsScreen`: shows a spinner while a deep-linked deal loads, then
+  the normal details page. If the fetch fails (unknown id, network), it shows
+  "Couldn't load this deal" with **Try again**.
+
+### Why this fix
+
+The deep-link URL is the screen's real contract: `id` is enough to show a
+deal, and the argument is only an optimisation to skip a fetch. Making the
+screen work from the route alone fixes every entry point: push
+notifications, the in-app simulator, and any future link. The list path
+stays instant.
+
+### Alternatives considered
+
+- **Resolve the deal before navigating** (for example in a deep-link handler
+  or a `GetMiddleware` that fetches it and passes arguments). Rejected. It
+  needs a second path for platform-delivered routes (which go straight to
+  the navigator), and it blocks navigation on the network with no loading
+  UI.
+- **Look the deal up in `HomeController.deals`.** Rejected. On a cold start
+  or a deep link to a deal that isn't on a loaded page, there is nothing to
+  find. It also couples the details screen to the home feed.
+- **Catch the error and show a fallback screen.** Explicitly not acceptable
+  per the ticket. An error state exists only for a genuinely missing deal or
+  a failed request, with retry.
+
+### Edge cases
+
+- Invalid or missing `id` (`/deal?id=abc`): `int.tryParse` gives null, so
+  the screen goes straight to the error state (by the code path; not
+  exercised on the device).
+- Unknown id (`id=99999`, API 404): "Couldn't load this deal" + Try again,
+  tested.
+- **Not handled:** on a **cold start** from a deep link, the deal page is the
+  only route, so Back leaves the app instead of going to Home. The page
+  itself is fully working. Putting Home underneath would need custom
+  initial-route handling for platform deep links, and I kept it out of this
+  fix's scope.
+- **Not handled:** if the deal loads after the user has already left the
+  screen, the result is written to the closed controller. That is harmless.
+
+### Verification
+
+On the emulator:
+
+| Scenario | Result |
+|---|---|
+| Deep link via `adb` while the app is running | Deal 42 (*Mystery Japanese Basket*) loads fully. Add to bag works. Back returns to Home. |
+| Deep link via `adb` on a cold start (`am force-stop` first) | App opens directly on deal 42, no crash. |
+| Home → ⋮ → **Simulate deep link…** → Open | Deal 42 loads (`GET /deals/42`). |
+| Tap a card in the feed | Opens instantly from the argument, no extra `GET /deals/:id`. |
+| Deep link with `id=99999` | "Couldn't load this deal" + Try again (API 404), no crash. |
