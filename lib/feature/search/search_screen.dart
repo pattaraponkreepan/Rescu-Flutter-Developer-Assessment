@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
 import '../shared_widget/deal_card.dart';
+import '../shared_widget/deal_impression.dart';
 import 'search_deals_controller.dart';
 
 class SearchScreen extends GetView<SearchDealsController> {
@@ -38,10 +39,15 @@ class SearchScreen extends GetView<SearchDealsController> {
         }
         return ListView.builder(
           itemCount: controller.results.length,
-          itemBuilder: (context, index) => DealCard(
-            deal: controller.results[index],
-            source: 'search',
-          ),
+          itemBuilder: (context, index) {
+            final deal = controller.results[index];
+            return DealImpression(
+              deal: deal,
+              source: 'search',
+              position: index,
+              child: DealCard(deal: deal, source: 'search'),
+            );
+          },
         );
       }),
     );

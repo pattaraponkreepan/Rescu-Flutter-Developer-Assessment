@@ -12,7 +12,8 @@
 | RES-106 · Wrong pickup times; "Pickup today" misses deals | Fixed (with regression tests) |
 | RES-107 · Deep link opens to a crash | Fixed |
 | F-1 · Live flash-sale countdowns | Done (tests + rebuilds profiled) |
-| F-2, F-3 | Not started |
+| F-2 · Impression tracking | Done (tests + verified on device, no scroll regression) |
+| F-3 | Not started |
 
 ---
 
@@ -810,4 +811,121 @@ deterministically:
   `AppLifecycleState.paused` would be a small follow-up.
 - **Not handled:** checkout racing the expiry (the sale ends during the
   checkout request). That belongs to F-3's checkout/reservation handling.
+
+---
+
+## F-2 · Impression tracking
+
+### What it does
+
+- A `deal_impression` event is logged when a deal card has been **≥ 50%
+  visible for ≥ 1 continuous second**. Its properties are `deal_id`,
+  `source` (`home_feed`, `flash_rail` or `search`) and `position` (index in
+  its list).
+- **At most once per deal per app session**, across all lists. A deal seen
+  in the flash rail won't log again when it shows up in the feed or in
+  search.
+- Events are **delivered in batches** via `FakeApiService.sendAnalyticsBatch`:
+  immediately when 10 are waiting, or 15 s after the first unsent event,
+  whichever comes first.
+- They show up on **Home → ⋮ → Analytics debug**, as before.
+
+### Design
+
+- **`DealImpression`** is a thin wrapper around each card, used in the three
+  lists. It uses `visibility_detector` (already in `pubspec.yaml`) and only
+  forwards the visible fraction. It builds nothing new and never rebuilds
+  the card.
+- **`ImpressionTracker` (a `GetxService`)** owns the rules, so they hold
+  across screens:
+  - a `Set` of deal ids already logged this session;
+  - one dwell `Timer` per card that is currently ≥ 50% visible, keyed by
+    `source:dealId`.
+  
+  When the fraction drops below 50% (scrolled away, or disposed), the timer
+  is cancelled, so the second must be continuous. When the timer fires, the
+  deal is added to the set. If two lists show the same deal at the same
+  time, the first timer wins and the second is ignored.
+- **`AnalyticsService` batching:**
+  - The 15 s timer is started by the *first* unsent event only, so later
+    events don't push the deadline back.
+  - Reaching 10 flushes immediately.
+  - Only one request is in flight at a time. Events logged meanwhile are
+    queued, and flushed right after it if they became due.
+  - A failed batch is put back at the front of the queue and retried after
+    15 s instead of in a tight loop, so events aren't lost.
+- **Precision vs. cost:** `visibility_detector` throttles its callbacks
+  (500 ms by default). With 500 ms, a card seen for about 0.6 s could be
+  counted, because the "hidden" report arrives late. I set
+  `VisibilityDetectorController.updateInterval` to 100 ms, which keeps the
+  error small. The scroll measurements below show no cost from it.
+
+### Decision: batching covers all analytics events
+
+The brief says "don't send events one by one: batch them". Before this
+change, `AnalyticsService` never sent anything to the backend. I made the
+batching part of `AnalyticsService` itself, so **every** event
+(`screen_view`, `deal_details_view`, `deal_impression`) is delivered the same
+way. The alternative was a separate impression-only queue. That would keep
+two delivery paths and leave the other events never delivered. A side
+effect is that non-impression events count towards the 10-event threshold,
+so a batch can go out slightly earlier. That is still within the rule.
+
+### Verified on the emulator
+
+| Scenario | Result |
+|---|---|
+| Idle 3 s on Home | Impressions for deals 1 and 5 (rail) and 2 (feed). Deal 1 is also first in the feed, and was logged only once. |
+| One fast fling through ~16 cards | **0** events while flying past. Only the cards it settled on (19, 20) were logged. |
+| Slow scroll, pausing 1.5 s | One impression per card, `position` = index in the feed. |
+| 10 events waiting | `POST /analytics/batch events=10` sent immediately. |
+| Scroll back over cards already seen | **0** new impressions. |
+| Leftover events | Sent in one batch 15 s after the first of them (`events=4`). |
+| Search "sushi" | `source: search`, positions 0, 1, 2. ("vegan" logged nothing, correctly: its top results had already been seen in the feed.) |
+| Totals | 14 events logged = 14 events sent. |
+
+### Scroll performance (no regression)
+
+Profile mode, same scripted 30-fling scroll through all 7 pages, app data
+cleared before each run. "Before" is the build right before this feature.
+
+| Metric | Before F-2 | After F-2 |
+|---|---|---|
+| UI frame time: avg / p90 | 2.21 / 3.96 ms | 2.06 / 3.64 ms |
+| UI frames over 16.7 ms | 1 of 817 | 2 of 868 |
+| Raster avg | 20.58 ms | 20.64 ms |
+| Total PSS | 139 MB | 133 MB |
+
+The differences are within run-to-run noise on the emulator. There is one
+run each, so I would not read anything more into them.
+
+### Tests (`test/impression_tracking_test.dart`)
+
+These use a fake-async clock and a recording API:
+
+- The batch is sent the moment the 10th event is logged.
+- The 15 s window is measured from the first unsent event: an event at 10 s
+  does not delay the 15 s send.
+- A failed batch keeps its events and they are retried.
+- An impression is logged after exactly 1 s at ≥ 50%, with its properties.
+- 49% never counts. Dropping out at 0.9 s cancels it, and becoming visible
+  again restarts the full second.
+- One impression per deal per session, whether the deal is re-shown in the
+  same list, shown in another list later, or shown in two lists at once.
+
+### Edge cases
+
+- **A card covered by another screen:** `visibility_detector` reports 0% when
+  an ancestor stops painting the widget (`render_visibility_detector.dart`,
+  the `paintsChild` check), so pushing a route should cancel the pending
+  dwell. I confirmed this in the library source, but I didn't test it
+  separately on the device.
+- **Filter changes (Pickup today):** `position` is the index in the list as
+  it is displayed when the dwell starts.
+- **Not handled:** events still in the queue when the app is killed are
+  lost. Flushing on `AppLifecycleState.paused`, or persisting the queue,
+  would fix it.
+- **Not handled:** batches can exceed 10 if more events arrive while a
+  request is in flight. They are sent together right after it. Splitting
+  them into chunks of 10 is easy if the backend caps batch size.
 

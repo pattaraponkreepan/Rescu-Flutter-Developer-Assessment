@@ -5,6 +5,7 @@ import 'package:pull_to_refresh/pull_to_refresh.dart';
 import '../../app_config.dart';
 import '../../routes/routes.dart';
 import '../shared_widget/deal_card.dart';
+import '../shared_widget/deal_impression.dart';
 import '../shared_widget/shimmer_deal_card.dart';
 import 'home_controller.dart';
 import 'widget/flash_deals_section.dart';
@@ -106,7 +107,14 @@ class HomeScreen extends GetView<HomeController> {
               if (index == headerCount + deals.length) {
                 return const SizedBox(height: 24);
               }
-              return DealCard(deal: deals[index - headerCount]);
+              final position = index - headerCount;
+              final deal = deals[position];
+              return DealImpression(
+                deal: deal,
+                source: 'home_feed',
+                position: position,
+                child: DealCard(deal: deal),
+              );
             },
           ),
         );
