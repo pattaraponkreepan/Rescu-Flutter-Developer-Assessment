@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
 import '../../app_config.dart';
+import '../../model/deal_model.dart';
 import '../shared_widget/the_network_image.dart';
 import 'deal_details_controller.dart';
 
@@ -10,7 +11,34 @@ class DealDetailsScreen extends GetView<DealDetailsController> {
 
   @override
   Widget build(BuildContext context) {
-    final deal = controller.deal;
+    return Obx(() {
+      final deal = controller.deal;
+      if (deal == null) {
+        // Opened from a deep link: the deal is still being fetched.
+        return Scaffold(
+          appBar: AppBar(),
+          body: Center(
+            child: controller.loadFailed.value
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text("Couldn't load this deal."),
+                      const SizedBox(height: 12),
+                      FilledButton(
+                        onPressed: controller.loadDeal,
+                        child: const Text('Try again'),
+                      ),
+                    ],
+                  )
+                : const CircularProgressIndicator(),
+          ),
+        );
+      }
+      return _buildDeal(deal);
+    });
+  }
+
+  Widget _buildDeal(DealModel deal) {
     return Scaffold(
       body: CustomScrollView(
         slivers: [
