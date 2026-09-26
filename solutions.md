@@ -5,7 +5,8 @@
 | Ticket / feature | Status |
 |---|---|
 | RES-101 · Search shows results for the wrong query | Fixed |
-| RES-102 – RES-107 | Not started |
+| RES-104 · Duplicate deals in the home feed | Fixed (with regression tests) |
+| RES-102, RES-103, RES-105 – RES-107 | Not started |
 | F-1 – F-3 | Not started |
 
 ---
@@ -101,3 +102,106 @@ dependencies.
 I re-ran the repro on the emulator after the fix. The responses still arrived
 out of order (`sushi` → `su` → `sush` → `s`), and the list correctly showed
 *Surprise Sushi Box*, *Lucky Sushi Platter* and *End-of-day Sushi Bag*.
+
+---
+
+## RES-104 · Duplicate deals in the home feed
+
+### Reproduction
+
+On a device the bug depends on timing: page requests take 250–950 ms, and
+the refresh has to land inside that window. To reproduce it deterministically
+I wrote `test/home_controller_test.dart`. It uses a `DealRepo` whose requests
+stay pending until the test completes them, so the test controls the order
+in which responses arrive.
+
+Against the original code:
+
+- **Load page 2, pull to refresh, refresh returns first, then page 2
+  returns.** The feed ends up with 40 items right after the refresh (page 1
+  plus the stale page 2). Scrolling on requests page 2 *again*, which
+  duplicates those 20 cards.
+- **Same, but the stale page 2 fails.** The next load requests **page 1**
+  again, which duplicates it.
+
+Repeat either and the feed grows past the 122 deals in the catalog.
+
+### Root cause
+
+`HomeController` keeps pagination state (`_page`, `_isFetchingMore`, the
+`deals` list), and `loadMore` and `refreshDeals` both mutate it across an
+`await` with no coordination:
+
+1. `loadMore` increments `_page` to 2 **before** its request, then awaits.
+2. `refreshDeals` sets `_page = 1` and replaces `deals` with page 1.
+3. The old `loadMore` resumes and runs `deals.addAll(page2)` on the **new**
+   list. That response belongs to the feed that the refresh just replaced.
+   The feed now holds pages 1 + 2 while `_page` says 1.
+4. The next `loadMore` asks for page 2 again, which produces duplicates.
+   On the failure path, `_page--` turns 1 into 0, so the next load re-fetches
+   page 1.
+
+The underlying problem: a page request doesn't know which feed it was made
+for. A response from before the refresh is applied to the list after it.
+
+### Fix
+
+`lib/feature/home/home_controller.dart`:
+
+- **Feed generation.** When a refresh's page 1 arrives, it bumps
+  `_feedGeneration`. `loadMore` records the generation when it starts. After
+  the `await`, it applies its result (or its error handling) only if the
+  generation is unchanged. Otherwise the result is for a feed that no longer
+  exists, and it is dropped.
+- **Commit pagination on success only.** `loadMore` computes
+  `nextPage = _page + 1` locally and sets `_page = nextPage` only after the
+  page has been appended. The `_page++` / `_page--` rollback is gone, so a
+  failure can no longer rewind the counter.
+- Because the dropped request will never call `loadComplete()`, the refresh
+  resets `_isFetchingMore` and ends the footer spinner itself. Otherwise the
+  footer would stay stuck in "loading".
+
+### Why this fix
+
+The feed stays consistent under **every** ordering. A page is appended only
+to the feed it was requested for, and `_page` always matches what is in the
+list. The generation is bumped when the refresh *lands*, not when it starts.
+That covers both a page requested before the refresh and one requested while
+the refresh is still in flight. `pull_to_refresh` 2.0.0 does not block
+load-more while refreshing, so I didn't rely on it.
+
+### Alternatives considered
+
+- **Deduplicate by `deal.id` before `addAll`.** Rejected. It hides the
+  duplicates but `_page` still desyncs, so pages get skipped or re-fetched
+  and the "more items than the catalog" problem remains in other forms. That
+  is a symptom fix.
+- **Block refresh while a page is loading (or the other way round).**
+  Rejected. The user explicitly pulled to refresh, and making them wait for a
+  page they no longer want is worse UX.
+- **Cancel the in-flight request.** Not possible: the fake API's futures
+  can't be cancelled, so the response still arrives and has to be ignored
+  anyway.
+
+### Edge cases
+
+- Stale page arrives after the refresh: dropped (test 1).
+- Stale page arrives before the refresh lands: appended to the old list, then
+  replaced by the refresh (test 2).
+- Stale page fails: its error is ignored and the counter isn't touched
+  (test 3).
+- **Not handled:** if `refreshDeals` itself throws, it never calls
+  `refreshFailed()`, so the header can stay in the refreshing state. That
+  behaviour is unchanged and outside this ticket.
+- **Not handled:** after reaching the last page (`loadNoData`), a refresh
+  doesn't reset the footer's "no more" state
+  (`refreshCompleted(resetFooterState: true)`). That is a separate issue.
+
+### Verification
+
+- `flutter test`: tests 1 and 3 fail on the original code (40 items after
+  the refresh / page 1 re-requested) and pass after the fix. Test 2 covers the
+  other ordering, which the original code already handled, so the fix can't
+  regress it. All tests pass.
+- On the emulator: scrolling loads pages 1 → 5, pull-to-refresh reloads
+  page 1, and scrolling again loads pages 2 → 3 → 4 with no duplicates.
