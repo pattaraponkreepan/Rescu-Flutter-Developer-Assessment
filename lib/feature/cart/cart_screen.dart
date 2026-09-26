@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
 import '../../app_config.dart';
+import '../../model/cart_item_model.dart';
+import '../../service/cart_service.dart';
+import '../shared_widget/countdown.dart';
 import '../shared_widget/the_network_image.dart';
 import 'cart_controller.dart';
 
@@ -17,6 +20,7 @@ class CartScreen extends GetView<CartController> {
         if (cart.items.isEmpty) {
           return const Center(child: Text('Your bag is empty'));
         }
+        final checkingOut = controller.isCheckingOut.value;
         return ListView.builder(
           padding: const EdgeInsets.symmetric(vertical: 8),
           itemCount: cart.items.length,
@@ -56,15 +60,21 @@ class CartScreen extends GetView<CartController> {
                                   fontSize: 13,
                                   color: AppConfig.primaryGreen,
                                   fontWeight: FontWeight.w600)),
+                          const SizedBox(height: 4),
+                          _HoldStatus(item: item, cart: cart),
                         ],
                       ),
                     ),
                     Row(
                       children: [
+                        // Locked during checkout so the bag can't change
+                        // under the order being placed.
                         IconButton(
                           visualDensity: VisualDensity.compact,
                           icon: const Icon(Icons.remove_circle_outline),
-                          onPressed: () => cart.decrement(item.deal.id),
+                          onPressed: checkingOut
+                              ? null
+                              : () => cart.decrement(item.deal.id),
                         ),
                         Text('${item.quantity}',
                             style: const TextStyle(
@@ -72,7 +82,8 @@ class CartScreen extends GetView<CartController> {
                         IconButton(
                           visualDensity: VisualDensity.compact,
                           icon: const Icon(Icons.add_circle_outline),
-                          onPressed: () => cart.add(item.deal),
+                          onPressed:
+                              checkingOut ? null : () => cart.add(item.deal),
                         ),
                       ],
                     ),
@@ -118,6 +129,60 @@ class CartScreen extends GetView<CartController> {
           ),
         );
       }),
+    );
+  }
+}
+
+/// How long this line is held for: "Reserving…", "Held for 04:32", or
+/// "Reservation ran out" with a way to reserve again.
+class _HoldStatus extends StatelessWidget {
+  final CartItemModel item;
+  final CartService cart;
+
+  const _HoldStatus({required this.item, required this.cart});
+
+  @override
+  Widget build(BuildContext context) {
+    final grey = TextStyle(fontSize: 12, color: Colors.grey.shade600);
+    final hold = item.reservation;
+    if (hold == null || hold.quantity != item.quantity) {
+      return Text(hold == null ? 'Reserving…' : 'Updating reservation…',
+          style: grey);
+    }
+    return ExpiryBuilder(
+      endsAt: hold.expiresAt,
+      builder: (context, lapsed) {
+        if (lapsed) {
+          // Wrap, not Row (here and below): next to the quantity buttons
+          // there isn't always room on one line, e.g. with larger system
+          // font sizes.
+          return Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Text('Reservation ran out',
+                  style: grey.copyWith(color: Colors.orange.shade800)),
+              TextButton(
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+                onPressed: () => cart.renewHold(item.deal.id),
+                child: const Text('Reserve again'),
+              ),
+            ],
+          );
+        }
+        return Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Icon(Icons.lock_clock_outlined,
+                size: 14, color: Colors.grey.shade600),
+            const SizedBox(width: 4),
+            Text('Held for ', style: grey),
+            CountdownText(endsAt: hold.expiresAt, style: grey),
+          ],
+        );
+      },
     );
   }
 }
