@@ -1,6 +1,11 @@
 import 'package:intl/intl.dart';
 
 /// A store's pickup window. The API sends instants as ISO-8601 UTC strings.
+///
+/// [start] and [end] are instants. Anything the user reads as a clock time or
+/// a calendar day must be derived in local time: formatting or taking `.day`
+/// of the parsed UTC value gives UTC wall-clock time (06:00 in Bangkok shows
+/// as 23:00 the day before).
 class PickupWindowModel {
   final DateTime start;
   final DateTime end;
@@ -14,12 +19,19 @@ class PickupWindowModel {
     );
   }
 
-  /// Human readable label, e.g. "17:30 – 21:00".
+  /// Human readable label in local time, e.g. "17:30 – 21:00".
   String get label =>
-      '${DateFormat('HH:mm').format(start)} – ${DateFormat('HH:mm').format(end)}';
+      '${DateFormat('HH:mm').format(start.toLocal())} – '
+      '${DateFormat('HH:mm').format(end.toLocal())}';
 
-  /// Whether pickup starts today.
-  bool get isToday => start.day == DateTime.now().day;
+  /// Whether pickup starts on today's local calendar date.
+  bool get isToday {
+    final localStart = start.toLocal();
+    final now = DateTime.now();
+    return localStart.year == now.year &&
+        localStart.month == now.month &&
+        localStart.day == now.day;
+  }
 
   /// Whether the store is currently accepting pickups.
   bool get isOpenNow {

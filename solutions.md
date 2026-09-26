@@ -9,7 +9,8 @@
 | RES-103 · Requests pile up the longer you browse | Fixed |
 | RES-104 · Duplicate deals in the home feed | Fixed (with regression tests) |
 | RES-105 · Home feed is janky and memory keeps climbing | Fixed (measured before/after) |
-| RES-106, RES-107 | Not started |
+| RES-106 · Wrong pickup times; "Pickup today" misses deals | Fixed (with regression tests) |
+| RES-107 | Not started |
 | F-1 – F-3 | Not started |
 
 ---
@@ -498,3 +499,103 @@ already on screen were rebuilt on every frame.
 - **Not handled:** the shimmer placeholders use `ShaderMask`, and each one
   costs a `saveLayer` per frame while an image is loading. That adds to
   raster cost during loading. It is a smaller effect and I left it.
+
+---
+
+## RES-106 · Wrong pickup times; "Pickup today" filter misses deals
+
+### Reproduction
+
+I used the Android emulator with its time zone set to `Asia/Bangkok`, at
+01:30 local time on 27 Sep. Every card shows its pickup window in **UTC**:
+
+| Store | Real hours (Bangkok) | Card showed |
+|---|---|---|
+| Sunrise Bakehouse | 06:00 – 09:30 | **23:00 – 02:30** (the ticket's example) |
+| Baan Somtam Kitchen | 05:30 – 08:00 | 22:30 – 01:00 |
+| Chao Phraya Sushi | 22:00 – 01:00 | 15:00 – 18:00 |
+
+With **Pickup today** on, Baan Somtam Kitchen and Sunrise Bakehouse
+disappeared, even though both open later that same morning.
+
+### Root cause
+
+The backend is right: it sends ISO-8601 UTC instants (`...Z`). The bug is in
+how `PickupWindowModel` turns those instants into things a person reads:
+
+- `DateTime.parse('...Z')` returns a `DateTime` with `isUtc == true`. That is
+  the correct instant, but its fields (`hour`, `day`, and what
+  `DateFormat.format` prints) are **UTC wall-clock** values. `label`
+  formatted it directly, so Bangkok users saw times 7 hours early, sometimes
+  on the wrong side of midnight. That is why some users showed up at closed
+  stores.
+- `isToday` compared `start.day` (the **UTC** day of the month) with
+  `DateTime.now().day` (the **local** day). Anything opening before 07:00
+  Bangkok time starts "yesterday" in UTC, so the filter dropped it. It also
+  compared only the day of the month, so 27 Oct would count as "today" on
+  27 Sep.
+
+Comparisons between instants (`isOpenNow`, `untilStart`, the order and
+flash-sale countdowns) were already correct, because `isAfter`/`difference`
+compare instants whatever the zone. Only the "human" views were wrong.
+
+### Fix
+
+`lib/model/pickup_window_model.dart`: keep `start`/`end` as instants, and
+convert to local time exactly where a clock time or calendar day is derived.
+
+- `label` formats `start.toLocal()` and `end.toLocal()`.
+- `isToday` compares the full local date (year, month, day) of
+  `start.toLocal()` with `DateTime.now()`.
+
+### Why this fix
+
+It fixes the cause in the one model every screen goes through: the feed
+cards, the details screen and the filter all use `label` and `isToday`. It
+keeps the instant as the source of truth and treats "which day / what time
+is it for this user" as a presentation concern. The backend contract stays
+untouched.
+
+### Alternatives considered
+
+- **Convert to local in `fromJson` (`DateTime.parse(...).toLocal()`).**
+  Also works for the app. I rejected it because the fix would then depend
+  on every producer of `PickupWindowModel` passing local values. A window
+  built from UTC (as the tests and any future caller would do) would
+  silently bring the bug back. Deriving local time in the getters works
+  whatever the input's zone.
+- **Hard-coding Bangkok time (`+7`) in the client.** Rejected. It encodes
+  the server's market in the client and breaks when the market expands.
+- **Showing the store's own time zone instead of the device's.** That is the
+  "right" answer for a traveller browsing another city's stores. But the API
+  doesn't send a store time zone or offset, so the client has no correct way
+  to do it. With this API, device-local time is the best choice. The proper
+  fix would be for the backend to add an IANA zone per store.
+
+### Edge cases
+
+- Overnight windows (22:00 – 01:00) keep their local times (tested).
+- "Today" for a window that opens late tonight but ends after midnight:
+  counts as today, because the start is today.
+- **Not handled:** a user whose device time zone differs from the store's
+  sees their own local time (see above; this needs API data).
+- **Not handled / by design:** a window that already ended today is rolled
+  to tomorrow by the backend, so it correctly drops out of "Pickup today".
+
+### Tests
+
+`test/pickup_window_model_test.dart` builds windows the way the API does
+(local wall-clock time → `toUtc().toIso8601String()`) and checks `label` and
+`isToday`. Early morning, late evening, tomorrow, and the same day of the
+month in the next month are all covered. On the original code, 4 of the 6
+tests fail on a UTC+7 machine. All pass after the fix.
+
+These tests only catch the bug when the test process isn't in UTC. CI
+should run them with a non-UTC zone (for example `TZ=Asia/Bangkok flutter
+test` on Linux/macOS), ideally with both an east and a west zone.
+
+### Verification
+
+On the emulator after the fix, every card shows local hours (Sunrise
+Bakehouse **06:00 – 09:30**). With **Pickup today** on, all 7 stores in the
+first pages appear, including Baan Somtam Kitchen and Sunrise Bakehouse.
