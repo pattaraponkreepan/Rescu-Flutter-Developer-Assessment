@@ -729,14 +729,15 @@ per-second rebuilds touch only the text. That needs three pieces:
    100 countdowns on screen there is still one timer and one tick per second,
    not 100 timers drifting apart. All countdowns also change on the same
    frame, so the screen doesn't tick in a staggered way.
-2. **Only the `Text` listens to the tick.** `FlashCountdownText` is
+2. **Only the `Text` listens to the tick.** `CountdownText` is
    `Obx(() => Text(format(endsAt - clock.now)))`, and that `Obx` is the only
    thing that reads `now`. Each tick rebuilds exactly one `Text` per visible
    countdown. The badge, card, list and screen are not rebuilt. The digits
    use tabular figures, so their width doesn't change and the badge isn't
    re-laid out every second.
-3. **Cards change state once, not every second.** `FlashExpiryBuilder` (a
-   `StatefulWidget`) schedules **one** `Timer` for the exact expiry moment and
+3. **Cards change state once, not every second.** `ExpiryBuilder` (a
+   `StatefulWidget`, generalised in F-3 to also drive bag-reservation
+   countdowns) schedules **one** `Timer` for the exact expiry moment and
    calls `setState` once. So a card rebuilds a single time, when it expires,
    rather than checking `now` on every tick. The timer is cancelled in
    `dispose()` (lesson from RES-102), and rescheduled in `didUpdateWidget` if
@@ -755,8 +756,8 @@ one countdown visible:
 
 ```
 widget rebuilds total: 20
-  10  Obx   flash_countdown.dart:36
-  10  Text  flash_countdown.dart:36
+  10  Obx   countdown.dart:36
+  10  Text  countdown.dart:36
 ```
 
 That is one `Text` rebuild per visible countdown per second, and **zero**
@@ -771,7 +772,7 @@ was in the bag together with a regular deal. At 02:53:39:
 - The regular deal stayed in the bag.
 - Tapping the expired card did nothing.
 
-### Tests (`test/flash_countdown_test.dart`)
+### Tests (`test/countdown_test.dart`)
 
 `ClockService` takes an injectable `currentTime`, so the tests drive time
 deterministically:
@@ -785,8 +786,8 @@ deterministically:
 
 ### Alternatives considered
 
-- **A `Timer.periodic` in each countdown widget.** Rejected. That means N
-  timers for N countdowns, and they tick out of phase with each other.
+- **A `Timer.periodic` in each countdown widget.** Rejected. That means *N*
+  timers for *N* countdowns, and they tick out of phase with each other.
   Getting the lifecycle wrong is also exactly RES-102.
 - **One `Obx` around the card (or list) that reads `now`.** Rejected. That
   is the RES-105 anti-pattern: every card would rebuild every second.
@@ -1275,7 +1276,7 @@ What I'd change in the code to make this solid:
 
 ## Time spent
 
-**TODO (candidate): total hours actually spent.**
+Roughly **2 days**, about **1 hour per ticket/feature** on average.
 
 For reference, the commit history runs from 26 Sep 2026 17:20 (first fix,
 RES-101) to 27 Sep 2026 03:42 (last F-3 commit), over 30 non-merge commits.
