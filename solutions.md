@@ -1087,3 +1087,218 @@ overflow. I checked that it does fail when the lapsed row is put back to a
   server doesn't know about flash expiry, so the order would go through at
   the flash price that was valid when the user tapped.
 
+---
+
+## AI usage log
+
+### Tools and what I used them for
+
+I used **Claude Code** (Claude Opus 5.5, in VS Code) throughout. It
+proposed code, tests and write-ups. I reviewed every diff before
+committing, and I can walk through each of them.
+
+- **Toolchain setup.** Installing the pinned Flutter 3.27.0, JDK 17, the
+  Android SDK and an emulator on Windows.
+- **Reproducing bugs on a real app.** It drove the Android emulator through
+  `adb` (taps, typing, flings, deep links), read the screen with
+  `uiautomator`, and took screenshots, so every bug was reproduced before it
+  was fixed.
+- **Getting DevTools data I could compare.** It wrote a small VM-service
+  client that records the same data DevTools shows:
+  - the `Flutter.Frame` events behind the frame chart;
+  - the `Flutter.RebuiltWidgets` events behind Rebuild Stats;
+  - `imageCache` sizes.
+
+  I ran it with identical scripted gestures before and after each change
+  (RES-105, F-1, F-2).
+- **Reading code and proposing fixes.** Finding root causes, alternatives,
+  and the regression tests. I checked library behaviour against the actual
+  package source in the pub cache (GetX `ever`, `pull_to_refresh`,
+  `visibility_detector`) instead of trusting memory.
+- **Drafting this document.** I edited it, and every number in it comes
+  from a run in this repo.
+
+### Where the AI was wrong or misleading, and how it was caught
+
+1. **A test script that "passed" without testing anything (RES-101, and
+   again while verifying the merged `main`).**
+   - The automated check left the search screen by pressing Back twice. The
+     second Back closed the app, so the following steps ran against the
+     launcher.
+   - The second time, it reported "RES-102: 0 `setState() called after
+     dispose()` errors" as a pass. My orders had never actually been
+     opened.
+   - **Caught** because the log had no `screen_view /orders` at all.
+   - **Fix:** every step now asserts which screen it is on (log or UI dump)
+     before trusting a result. Lesson: a green result from a check that
+     can't fail is worth nothing.
+2. **A widget test that "proved" a layout fix for the wrong reason (F-3).**
+   - The bag's "Reservation ran out" row overflowed by 23 px on the device.
+     After the fix, the AI claimed the new test fails on the old `Row` and
+     passes on `Wrap`.
+   - Reading the full error showed the overflow came from a *different*
+     row ("Held for", line 174). It only overflowed because the test font
+     is wider than Roboto.
+   - The test had also never reached the "ran out" state, because the
+     one-shot expiry `Timer` needed 5 minutes of fake time and only 1 second
+     was pumped.
+   - **Fix:** pump the full 5 minutes, make both rows `Wrap` (this also
+     covers large system font sizes), and re-prove it. Reverting *only* the
+     lapsed row to `Row` now fails the test at that row.
+3. **Debug-mode timings presented as a regression (RES-105).**
+   - After the fix, debug-mode frame times looked *worse* (build average
+     14.4 → 19.0 ms).
+   - Debug mode (JIT, asserts) isn't meaningful for timing. Rebuild counts
+     had clearly improved, so the timings didn't add up.
+   - **Fix:** re-measured before *and* after in profile mode. UI frame time
+     improved (3.96 → 3.37 ms average). Only profile timings are quoted.
+   - In the same task, the first probe read the VM timeline, which is a
+     **ring buffer**. It reported "0 frames, 6 `Obx` rebuilds" for a long
+     scroll. **Fix:** switched to listening to the event stream for the
+     whole run.
+4. **Overclaiming in the write-up.**
+   - RES-104: the first draft said "all 3 new tests fail on the original
+     code". Test 2 (a page landing *before* the refresh) passes on the
+     original code. **Fix:** the text now says which tests fail and why
+     test 2 exists.
+   - F-3: a draft error message said "nothing was charged" for *unknown*
+     checkout errors. That is only known for 410 (validated before the
+     order is created) and 502 (the backend says so). **Fix:** the generic
+     message no longer claims it.
+   - F-3: the first draft said checkout validates reservations "before
+     anything else". The intermittent 502 can fire before that check.
+     **Fix:** corrected.
+5. **Timers in tests created outside the fake clock (F-1, F-2).**
+   - The first versions created `ClockService` in `setUp`, which runs
+     outside `testWidgets`' fake-async zone. Its `Timer.periodic` never fired
+     on `pump()`, so the tests failed for the wrong reason.
+   - **Fix:** create the services inside each test body, and dispose them
+     so no timers are left pending.
+6. **A silent setup failure.** Accepting the Android licenses by piping `y`
+   into `sdkmanager` from PowerShell accepted nothing. The output said so,
+   and it was redone through `cmd`.
+
+---
+
+## Design questions
+
+**Q1: `GetxController` lifecycle vs widget `State` lifecycle.**
+
+A `State` belongs to one element in the widget tree:
+
+- `initState` runs when the element is mounted, and `dispose` when it is
+  unmounted.
+- It can come and go many times on a single screen, for example list tiles
+  scrolling out, or `PickupCountdown` per order tile.
+
+A `GetxController` belongs to the DI container, not to a widget:
+
+- Here it is created lazily by the route's `Binding` (`Get.lazyPut`), and
+  `onInit` runs on the first `Get.find`.
+- `onClose` runs when GetX's smart management deletes it after the route is
+  popped.
+- `GetxService`s (`CartService`, `ClockService`, `AnalyticsService`) live for
+  the whole session.
+
+So the question is always *whose* lifetime a resource follows. Anything a
+controller subscribes to on a longer-lived object outlives the screen unless
+`onClose` cancels it. GetX's `ever()` is just a stream subscription; it is
+not tied to the controller.
+
+- **RES-103** is exactly that confusion. `DealDetailsController` did
+  `ever(cartService.itemCount, …)` as if the subscription would die with
+  the screen. Every closed deal page stayed subscribed to the session-long
+  `CartService` and re-fetched on each cart change.
+- **RES-102** is the same mistake on the `State` side: a `Timer` started in
+  `initState` and never cancelled in `dispose`.
+
+**Q2: When does wrapping a large subtree in a single `Obx` hurt?**
+
+An `Obx` rebuilds *everything* inside it whenever *any* observable it read
+changes. It hurts when:
+
+- the subtree is large (lists, whole screens);
+- one of the values changes often;
+- or it mixes values that change at very different rates.
+
+RES-105 was all three. One `Obx` around the whole `Scaffold` read
+`scrollOffset`, which changed on every scrolled pixel. Scrolling rebuilt the
+app bar, the FAB and every mounted card on every frame (15,009 widget
+rebuilds in one scripted scroll → 4,408 after the fix).
+
+How I decide the scope:
+
+- **Wrap the smallest widget that actually displays the value.**
+- **Make the observable as coarse as the UI needs.** RES-105 turned the
+  offset into two `RxBool`s that only notify when a threshold is crossed.
+- **Match the mechanism to the change rate.** F-1's per-second countdown
+  puts `Obx` around the `Text` only (measured: exactly one `Text` rebuild
+  per visible countdown per second, zero card rebuilds). The once-only
+  "expired" switch uses a single one-shot timer instead of listening to
+  the tick.
+- **Read observables inside the `Obx` builder**, not lazily in item
+  builders, where the reads aren't tracked.
+
+Many small `Obx`es cost a subscription each. That is cheap compared with
+rebuilding a list, and Rebuild Stats confirms it rather than guessing.
+
+**Q3: An automated test that would have caught RES-106.**
+
+A unit test on `PickupWindowModel` that builds its input **the way the API
+does**: a known local wall-clock time, converted to a UTC ISO string. It
+then asserts:
+
+- `label` shows local time (06:00 → "06:00 – 09:30", not "23:00 – 02:30");
+- `isToday` is true for an early-morning and a late-evening window today;
+- `isToday` is false for tomorrow, and for the same day of the month next
+  month.
+
+That is `test/pickup_window_model_test.dart`: 4 of its 6 tests fail on the
+original code.
+
+The catch is the **time zone of the test process**. On a UTC CI machine,
+local time equals UTC, and the buggy code passes. So CI must run these
+tests in non-UTC zones, ideally one east and one west of UTC (for example
+`TZ=Asia/Bangkok` and `TZ=America/Los_Angeles flutter test` on
+Linux/macOS).
+
+What I'd change in the code to make this solid:
+
+- **Inject "now"** instead of calling `DateTime.now()` inside `isToday`.
+  F-1 introduced `ClockService(currentTime: …)` for exactly this, and the
+  countdown, expiry and reservation tests all drive a fake clock through it.
+- **Get the store's time zone from the API** (an IANA name per store).
+  Label and "today" then become pure functions of (instant, zone, now) that
+  are testable without depending on the machine's zone at all.
+
+---
+
+## Time spent
+
+**TODO (candidate): total hours actually spent.**
+
+For reference, the commit history runs from 26 Sep 2026 17:20 (first fix,
+RES-101) to 27 Sep 2026 03:42 (last F-3 commit), over 30 non-merge commits.
+Toolchain setup came before that.
+
+## With one more day
+
+1. **Verify on a real mid-range Android phone.** Especially RES-105's
+   raster time and GPU memory, which the emulator's virtual GPU can't show,
+   plus DevTools screenshots for this document.
+2. **App lifecycle.**
+   - Pause `ClockService` when the app is backgrounded.
+   - Flush the analytics queue on `paused` (F-2).
+   - Persist the bag and its reservation ids, so a restart doesn't lose them
+     (F-3).
+3. **Cold-start deep link (RES-107).** Put Home under the deal page, so
+   Back doesn't leave the app.
+4. **Debounce search (RES-101 follow-up)** to cut request volume. The race
+   is already fixed; this is only about load.
+5. **An `integration_test` suite for the key flows**, run in CI under two
+   time zones:
+   - add to bag;
+   - hold expiry;
+   - checkout with 409 / 410 / 502;
+   - deep link.
+
